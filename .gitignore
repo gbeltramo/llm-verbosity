@@ -1,0 +1,9 @@
+*~
+*.log
+*.db
+
+/dist/
+/build/
+/data/
+/llm_verbosity_stats/
+__pycache__/

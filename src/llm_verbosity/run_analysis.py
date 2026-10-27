@@ -1,13 +1,17 @@
 """Send the prepared questions to an LLM API and report time / token usage per dataset.
 
 Environment:
-    LLM_BASE_URL   e.g. https://api.example.com/v1  (or the full .../chat/completions URL)
+    LLM_BASE_URL   e.g. https://api.example.com/v1  (or the full endpoint URL)
     LLM_API_KEY
 
 Two thinking-control styles are supported (--api-style):
-    openai  : OpenAI-compatible, `reasoning_effort` = none|low|medium|high|max
-    budget  : special API, `"thinking": {"type": "enabled", "budget_tokens": N}` is added to the
-              payload, or removed entirely for --thinking none
+    openai  : OpenAI-compatible, `reasoning_effort` = none|low|medium|high|max, POSTed to
+              {LLM_BASE_URL}/chat/completions
+    budget  : special (agent) API, POSTed to {LLM_BASE_URL}/agent, with
+              `"thinking": {"type": "enabled", "budget_tokens": N}` added to the payload, or
+              omitted entirely for --thinking none
+Override the endpoint path with --endpoint (a path suffix such as `v1/agent`, or a full URL
+stored in LLM_BASE_URL).
 
 Token provenance (every token count is stored together with its source):
     api        reported verbatim by the API
@@ -50,6 +54,9 @@ SYSTEM_PROMPT = (
 
 THINKING_CHOICES = ("none", "low", "medium", "high", "max")
 THINKING_BUDGETS = {"low": 2048, "medium": 8192, "high": 16384, "max": 24576}  # --api-style budget
+# api-style -> endpoint appended to LLM_BASE_URL (it differs between the two API flavours)
+ENDPOINTS = {"openai": "chat/completions", "budget": "agent"}
+ENDPOINT_RE = re.compile(r"/(agent|chat/completions|completions|messages)$")
 RETRY_STATUS = {408, 409, 425, 429}
 TRUNCATED_REASONS = {"length", "max_tokens", "max_output_tokens"}
 
@@ -69,13 +76,15 @@ KEY_METRICS = ("thinking_tokens", "answer_tokens", "completion_tokens", "total_t
 STAT_METRICS = ("elapsed_s", *TOKEN_METRICS)
 
 WARNING_DESCRIPTIONS = {
-    "no_usage": "API returned no usage block -> all token counts estimated from text length",
+    "no_usage": "API returned no usage block -> timings block / chars/4 fallbacks used",
     "estimated_tokens": "some token counts are ESTIMATED (chars/4), not reported by the API",
     "assumed_tokens": "some token counts rest on an assumption (see JSON *_source fields)",
     "hidden_thinking_suspected": "thinking requested but no thinking tokens/text observed",
     "thinking_exceeds_completion": "reported thinking tokens > completion tokens",
     "answer_mismatch": "answer_tokens disagree strongly with the visible answer length",
     "missing_prompt_tokens": "prompt_tokens not reported -> total_tokens unavailable",
+    "tokens_from_timings": "counts taken from the engine timings block instead of the usage block",
+    "inconsistent_usage": "usage fields contradict each other (thinking + answer != completion)",
     "truncated": "generation stopped at the max token limit",
     "empty_answer": "no visible answer text (budget probably spent on thinking)",
     "retried": "request needed more than one attempt (time = successful attempt only)",
@@ -121,7 +130,7 @@ def format_message(question: dict, model_id: str) -> list[dict]:
     ]
 
 
-def build_payload(args: argparse.Namespace, messages: list[dict]) -> dict:
+def build_payload(args: argparse.Namespace, messages: list[dict], session_id: str) -> dict:
     payload: dict = {
         "model": args.model_id,
         "temperature": args.temperature,
@@ -129,6 +138,8 @@ def build_payload(args: argparse.Namespace, messages: list[dict]) -> dict:
         "stream": True,
         "messages": messages,
     }
+    if args.seed is not None:
+        payload["seed"] = args.seed
     if args.api_style == "openai":
         payload["max_completion_tokens"] = args.max_completion_tokens
         payload["stream_options"] = {"include_usage": True}
@@ -136,51 +147,121 @@ def build_payload(args: argparse.Namespace, messages: list[dict]) -> dict:
     else:  # budget
         payload["max_tokens"] = args.max_completion_tokens
         payload.update(web_tools=False, code_tools=False, canvas=False)
+        payload["metadata"] = {"user_id": session_id}
         if args.thinking != "none":
             budget = args.thinking_budget or THINKING_BUDGETS[args.thinking]
             payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
     return payload
 
 
-def resolve_url(base_url: str) -> str:
-    url = base_url.rstrip("/")
-    if url.endswith(("completions", "messages")):
+def resolve_url(base_url: str, endpoint: str | None = None) -> str:
+    """Append the endpoint path unless LLM_BASE_URL already contains one.
+
+    The two API flavours live on different paths (`/chat/completions` vs `/agent`), so a base
+    URL ending in /v1 must NOT be blindly completed with /chat/completions.
+    """
+    url = base_url.strip().rstrip("/")
+    if url.startswith(("http://", "https://")) and ENDPOINT_RE.search(url):
         return url
-    return f"{url}/chat/completions"
+    path = (endpoint or "").strip("/")
+    return f"{url}/{path}" if path else url
 
 
 @dataclass
 class StreamState:
-    thinking: list[str] = field(default_factory=list)
-    text: list[str] = field(default_factory=list)
+    """Accumulates one streamed response.
+
+    Content-block chunks are grouped per index (an agent step may open several blocks, e.g.
+    thinking at index 0 and text at index 1), so repeated/duplicated blocks are not merged
+    into one another.
+    """
+
+    blocks: dict[int, list[str]] = field(default_factory=dict)
+    kinds: dict[int, str] = field(default_factory=dict)  # index -> "thinking" | "text"
     usage: dict = field(default_factory=dict)
+    timings: dict = field(default_factory=dict)  # engine timings (llama.cpp/naiveai style)
     finish_reason: str | None = None
+    final_messages: list[dict] = field(default_factory=list)  # from the `agent_done` event
+    steps: int | None = None
+
+    def add(self, kind: str, index: int, chunk: str | None) -> None:
+        if not chunk:
+            return
+        self.kinds.setdefault(index, kind)
+        self.blocks.setdefault(index, []).append(chunk)
+
+    def _join(self, kind: str) -> str:
+        return "".join("".join(self.blocks[i]) for i in sorted(self.blocks) if self.kinds.get(i) == kind)
+
+    @property
+    def thinking(self) -> str:
+        return self._join("thinking")
+
+    @property
+    def text(self) -> str:
+        return self._join("text")
+
+
+def _message_texts(messages: list[dict]) -> tuple[str, str]:
+    """(thinking, text) of the assistant turns in a final `messages` array."""
+    thinking: list[str] = []
+    text: list[str] = []
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        blocks = content if isinstance(content, list) else [{"type": "text", "text": content or ""}]
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype in ("thinking", "redacted_thinking"):
+                thinking.append(block.get("thinking") or block.get("text") or "")
+            elif btype == "text":
+                text.append(block.get("text") or "")
+    return "".join(thinking), "".join(text)
 
 
 def consume_event(event: dict, st: StreamState) -> None:
-    """Handle both OpenAI-style chunks and `content_block_delta`-style events."""
+    """Handle OpenAI-style chunks, Anthropic-style content blocks and the `agent_done` event."""
     if err := event.get("error"):
         raise ApiError(500, json.dumps(err)[:500])
 
+    # --- OpenAI-style chunks
     for choice in event.get("choices") or []:
         delta = choice.get("delta") or {}
-        if delta.get("content"):
-            st.text.append(delta["content"])
-        if reasoning := (delta.get("reasoning_content") or delta.get("reasoning")):
-            st.thinking.append(reasoning)
+        st.add("text", 0, delta.get("content"))
+        st.add("thinking", 0, delta.get("reasoning_content") or delta.get("reasoning"))
         if choice.get("finish_reason"):
             st.finish_reason = choice["finish_reason"]
 
+    # --- typed events (content blocks / message deltas / agent lifecycle)
     etype = event.get("type")
     delta = event.get("delta") or {}
-    if etype == "content_block_delta":
-        if delta.get("type") == "text_delta":
-            st.text.append(delta.get("text", ""))
-        elif delta.get("type") == "thinking_delta":
-            st.thinking.append(delta.get("thinking", ""))
-    elif etype == "message_delta" and delta.get("stop_reason"):
-        st.finish_reason = delta["stop_reason"]
+    index = event.get("index") if isinstance(event.get("index"), int) else 0
+    if etype == "content_block_start":
+        block = event.get("content_block") or {}
+        st.kinds[index] = "thinking" if block.get("type") in ("thinking", "redacted_thinking") else "text"
+    elif etype == "content_block_delta":
+        dtype = delta.get("type")
+        if dtype == "text_delta":
+            st.add(st.kinds.get(index, "text"), index, delta.get("text"))
+        elif dtype == "thinking_delta":
+            st.add("thinking", index, delta.get("thinking") or delta.get("text"))
+    elif etype == "message_delta":
+        if delta.get("stop_reason"):
+            st.finish_reason = delta["stop_reason"]
+    elif etype == "agent_done":
+        st.final_messages.extend(m for m in (event.get("messages") or []) if isinstance(m, dict))
+        if isinstance(event.get("steps"), int):
+            st.steps = event["steps"]
+        if event.get("stop_reason") and not st.finish_reason:
+            st.finish_reason = event["stop_reason"]
 
+    # --- token accounting side channels
+    naive = event.get("naivert") or {}
+    if isinstance(naive, dict) and isinstance(naive.get("timings"), dict):
+        st.timings = naive["timings"]
     for u in (event.get("usage"), (event.get("message") or {}).get("usage")):
         if isinstance(u, dict):
             st.usage.update({k: v for k, v in u.items() if v is not None})
@@ -214,7 +295,7 @@ async def request_with_retries(
         try:
             st = await stream_completion(client, url, headers, payload)
             elapsed = time.perf_counter() - t0
-            if not st.thinking and not st.text:
+            if not (st.thinking or st.text or st.final_messages):
                 raise EmptyResponseError("empty response")
             return st, elapsed, attempt
         except Exception as exc:
@@ -275,7 +356,48 @@ class TokenUsage:
     warnings: list[tuple[str, str]]  # (code, message)
 
 
-def parse_usage(usage: dict, thinking_text: str, text: str, thinking_requested: bool) -> TokenUsage:
+def _segment_tokens(segment: object, key: str = "tokens") -> int | None:
+    return _first(segment, key) if isinstance(segment, dict) else None
+
+
+def _timings_counts(timings: dict) -> dict[str, int]:
+    """Exact counts from an engine `timings` block (llama.cpp / naiveai style).
+
+    `prompt_n` counts the prompt tokens actually prefilled for this request; cached prompt tokens
+    are reported separately, so the prompt length is their sum. `segments` splits the generated
+    tokens into thinking rounds and answer rounds.
+    """
+    if not isinstance(timings, dict):
+        return {}
+    seg = timings.get("segments") if isinstance(timings.get("segments"), dict) else {}
+    out: dict[str, int] = {}
+
+    prompt_n = _first(timings, "prompt_n")
+    if prompt_n is not None:
+        out["prompt_tokens"] = prompt_n + (_first(timings, "n_prompt_tokens_cache", "cache_n") or 0)
+
+    think = _segment_tokens(seg.get("think"))
+    answer = _segment_tokens(seg.get("answer"))
+    if think is not None:
+        out["thinking_tokens"] = think
+    if answer is not None:
+        out["answer_tokens"] = answer
+    if think is not None and answer is not None:
+        out["completion_tokens"] = think + answer
+    elif (total := _segment_tokens(seg.get("total"))) is not None:
+        out["completion_tokens"] = total
+    elif (predicted := _first(timings, "predicted_n")) is not None:
+        out["completion_tokens"] = predicted
+    return out
+
+
+def parse_usage(
+    usage: dict,
+    thinking_text: str,
+    text: str,
+    thinking_requested: bool,
+    timings: dict | None = None,
+) -> TokenUsage:
     """Turn the raw `usage` block into token counts WITH provenance.
 
     answer_tokens is the clean "after thinking" measure:
@@ -285,13 +407,16 @@ def parse_usage(usage: dict, thinking_text: str, text: str, thinking_requested: 
         (estimated) and thinking = completion - answer (estimated); the visible answer is
         used because streamed thinking may be summarized/hidden and would undercount.
       * nothing reported -> everything estimated from text length
+
+    Any field the `usage` block omits is taken from the engine `timings` block when available
+    (exact, source `derived`); chars/4 estimation is only the last resort.
     """
     w: list[tuple[str, str]] = []
     v: dict[str, int | None] = {}
     s: dict[str, str] = {}
 
     if not usage:
-        w.append(("no_usage", "API returned no usage block; ALL token counts are estimated"))
+        w.append(("no_usage", "API returned no usage block; falling back to the timings block, then chars/4"))
 
     details = usage.get("completion_tokens_details") or usage.get("output_tokens_details") or {}
     if not isinstance(details, dict):
@@ -303,6 +428,24 @@ def parse_usage(usage: dict, thinking_text: str, text: str, thinking_requested: 
         thinking = _first(usage, "reasoning_tokens", "thinking_tokens")
     answer = _first(details, "answer_tokens", "text_tokens")  # rare, honoured if present
     total = _first(usage, "total_tokens")
+
+    # ---- fill the gaps from the engine timings (exact, but not part of the usage contract)
+    tc = _timings_counts(timings or {})
+    from_timings: set[str] = set()
+    missing_here = {
+        "prompt_tokens": prompt,
+        "thinking_tokens": thinking,
+        "answer_tokens": answer,
+        "completion_tokens": completion,
+    }
+    for name, value in list(missing_here.items()):
+        if value is None and (fallback := tc.get(name)) is not None:
+            missing_here[name] = fallback
+            from_timings.add(name)
+    prompt = missing_here["prompt_tokens"]
+    thinking = missing_here["thinking_tokens"]
+    answer = missing_here["answer_tokens"]
+    completion = missing_here["completion_tokens"]
 
     # ---- prompt
     v["prompt_tokens"], s["prompt_tokens"] = (prompt, API) if prompt is not None else (None, MISSING)
@@ -362,6 +505,24 @@ def parse_usage(usage: dict, thinking_text: str, text: str, thinking_requested: 
         both_api = s["thinking_tokens"] == API and s["answer_tokens"] == API
         v["completion_tokens"] = (v["thinking_tokens"] or 0) + (v["answer_tokens"] or 0)
         s["completion_tokens"] = DERIVED if both_api else ESTIMATED
+
+    # ---- values that did not come from the usage block are exact but not "api"
+    for m in sorted(from_timings):
+        if s.get(m) == API:
+            s[m] = DERIVED
+    if from_timings:
+        w.append(("tokens_from_timings", f"from engine timings: {', '.join(sorted(from_timings))}"))
+
+    # ---- the API's own numbers should add up: completion == thinking + answer
+    parts = (v.get("thinking_tokens"), v.get("answer_tokens"), v.get("completion_tokens"))
+    if None not in parts and parts[0] + parts[1] != parts[2]:
+        w.append(
+            (
+                "inconsistent_usage",
+                f"thinking {parts[0]} + answer {parts[1]} != completion {parts[2]} "
+                "(kept all three as reported, so the split is per-field)",
+            )
+        )
 
     # ---- sanity check: derived/api answer length vs. what we actually received as text
     if s["answer_tokens"] in (API, DERIVED, ASSUMED) and text:
@@ -442,12 +603,13 @@ async def run_job(
     row: dict,
 ) -> Result:
     res = Result(tag=tag, index=index, id=str(row["id"]))
+    session_id = f"verbosity-{tag}-{row['id']}"
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        "X-Session-Id": f"verbosity-{tag}-{row['id']}",
+        "X-Session-Id": session_id,
     }
-    payload = build_payload(args, format_message(row, args.model_id))
+    payload = build_payload(args, format_message(row, args.model_id), session_id)
     t_start = time.perf_counter()
     try:
         st, elapsed, attempts = await request_with_retries(
@@ -458,14 +620,17 @@ async def run_job(
         log.error("[%s] #%d FAILED permanently: %s", tag, index, res.error)
         return res
 
-    thinking_text, text = "".join(st.thinking), "".join(st.text)
+    # the final `agent_done` messages are complete; streamed deltas can be truncated/summarized
+    final_thinking, final_text = _message_texts(st.final_messages)
+    thinking_text = final_thinking or st.thinking
+    text = final_text or st.text
     res.ok = True
     res.elapsed_s = round(elapsed, 3)
     res.wall_with_retries_s = round(time.perf_counter() - t_start, 3)
     res.attempts = attempts
     res.finish_reason = st.finish_reason
 
-    usage = parse_usage(st.usage, thinking_text, text, args.thinking != "none")
+    usage = parse_usage(st.usage, thinking_text, text, args.thinking != "none", st.timings)
     res.tokens, res.token_sources = usage.values, usage.sources
     for code, msg in usage.warnings:
         add_warning(res, code, msg)
@@ -702,8 +867,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--temperature", type=float, required=True)
     p.add_argument("--thinking", type=thinking_type, default="none")
     p.add_argument("--api-style", choices=("openai", "budget"), default="openai")
+    p.add_argument(
+        "--endpoint",
+        default=None,
+        help="path appended to LLM_BASE_URL: 'chat/completions' (openai) or 'agent' (budget) by default; "
+        "an LLM_BASE_URL that already ends in an endpoint path is used as-is",
+    )
     p.add_argument("--thinking-budget", type=int, default=None, help="override budget_tokens")
-    p.add_argument("--max-completion-tokens", type=int, default=32768)
+    p.add_argument("--max-completion-tokens", type=int, default=256_000)
+    p.add_argument("--seed", type=int, default=None, help="sampling seed, sent only if set")
     p.add_argument("--workers", "-n", type=int, default=8)
     p.add_argument("--retries", type=int, default=5)
     p.add_argument("--timeout", type=float, default=600.0)
@@ -754,7 +926,8 @@ def main() -> None:
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
-    url = resolve_url(base_url)
+    url = resolve_url(base_url, args.endpoint or ENDPOINTS[args.api_style])
+    log.info("using endpoint %s (api-style=%s)", url, args.api_style)
     results = asyncio.run(run_all(args, url, api_key))
     summary = build_summary(results, args.datasets)
     print_table(summary, args)
@@ -763,7 +936,7 @@ def main() -> None:
     path = output_path(args)
     path.parent.mkdir(parents=True, exist_ok=True)
     config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
-    config.update(base_url=url, timestamp=datetime.now(UTC).isoformat())
+    config.update(url=url, base_url=base_url, timestamp=datetime.now(UTC).isoformat())
     path.write_text(
         json.dumps(
             {"config": config, "summary": summary, "results": [asdict(r) for r in results]},

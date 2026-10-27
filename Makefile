@@ -1,6 +1,9 @@
 # --- shared
 DATA_DIR    ?= data
 SEED        ?= 42
+# sampling seed forwarded to the API (empty = not sent)
+LLM_SEED    ?=
+MAX_COMPLETION_TOKENS ?= 256000
 
 # --- download-data
 # TEXT_ONLY=0 keeps image/audio/video questions
@@ -14,6 +17,8 @@ TEMPERATURE ?= 1.0
 THINKING    ?= none
 # openai | budget
 API_STYLE   ?= budget
+# endpoint path appended to LLM_BASE_URL; default: agent for budget, chat/completions for openai
+ENDPOINT    ?=
 WORKERS     ?= 2
 # subset: LIMIT=10 -> first 10 per dataset; add OFFSET=20 to skip, or SUBSET_SEED=1 for a random pick
 LIMIT       ?= 2
@@ -41,6 +46,9 @@ run-verbosity-analysis:
 		--temperature $(TEMPERATURE) \
 		--thinking $(THINKING) \
 		--api-style $(API_STYLE) \
+		$(if $(ENDPOINT),--endpoint $(ENDPOINT)) \
+		$(if $(LLM_SEED),--seed $(LLM_SEED)) \
+		--max-completion-tokens $(MAX_COMPLETION_TOKENS) \
 		--workers $(WORKERS) \
 		--data-dir $(DATA_DIR) \
 		$(if $(LIMIT),--limit $(LIMIT)) \

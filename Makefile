@@ -21,7 +21,7 @@ API_STYLE   ?= openrouter
 PROVIDER    ?= wafer/us
 # budget only: endpoint path appended to LLM_BASE_URL (default: agent)
 ENDPOINT    ?=
-# budget only: budget_tokens sent when THINKING=on
+# budget only: budget_tokens sent when THINKING=on (empty = script default: 4096)
 THINKING_BUDGET ?=
 RETRIES     ?= 5
 # per-request timeout in seconds (not streamed!)

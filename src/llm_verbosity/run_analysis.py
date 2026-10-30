@@ -65,6 +65,7 @@ DEFAULT_MAX_COMPLETION_TOKENS = 256_000
 
 API_STYLES = ("openrouter", "budget")
 BUDGET_ENDPOINT = "agent"
+DEFAULT_THINKING_BUDGET = 4096  # budget style: budget_tokens is REQUIRED when thinking is on
 ENDPOINT_RE = re.compile(r"/(agent|chat/completions|completions|messages)$")
 
 THINKING_CHOICES = ("none", "low", "medium", "high", "max")
@@ -164,7 +165,7 @@ def build_payload(args: argparse.Namespace, messages: list[dict], session_id: st
         "model": args.model_id,
         "temperature": args.temperature,
         "top_p": args.top_p,
-        "stream": False,
+        "stream": args.api_style == "budget",  # the agent API only answers as an SSE stream
         "max_tokens": args.max_completion_tokens,
         "messages": messages,
     }
@@ -176,11 +177,11 @@ def build_payload(args: argparse.Namespace, messages: list[dict], session_id: st
     else:  # budget: thinking is simply on or off
         payload.update(web_tools=False, code_tools=False, canvas=False)
         payload["metadata"] = {"user_id": session_id}
-        if args.thinking == "on":
-            thinking: dict = {"type": "enabled"}
-            if args.thinking_budget:
-                thinking["budget_tokens"] = args.thinking_budget
-            payload["thinking"] = thinking
+        if args.thinking == "on":  # the agent API rejects thinking without an integer budget_tokens
+            payload["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": args.thinking_budget or DEFAULT_THINKING_BUDGET,
+            }
     return payload
 
 
@@ -273,13 +274,77 @@ def parse_response(data: object) -> Parsed:
     return out
 
 
+def parse_stream(body: str) -> Parsed:
+    """Parse a streamed (SSE) body: OpenAI-style chunks, Anthropic-style blocks, `agent_done`."""
+    out = Parsed()
+    blocks: dict[int, list[str]] = {}
+    kinds: dict[int, str] = {}  # index -> "thinking" | "text"
+    messages: list[dict] = []
+
+    def add(kind: str, index: int, chunk: str | None) -> None:
+        if chunk:
+            kinds.setdefault(index, kind)
+            blocks.setdefault(index, []).append(chunk)
+
+    for line in body.splitlines():
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == "[DONE]":
+            continue
+        event = json.loads(data)
+        if err := event.get("error"):
+            raise api_error_from(err)
+
+        for choice in event.get("choices") or []:  # OpenAI-style chunks
+            delta = choice.get("delta") or {}
+            add("text", 0, delta.get("content"))
+            add("thinking", 0, delta.get("reasoning_content") or delta.get("reasoning"))
+            out.finish_reason = choice.get("finish_reason") or out.finish_reason
+
+        etype = event.get("type")
+        delta = event.get("delta") or {}
+        index = event.get("index") if isinstance(event.get("index"), int) else 0
+        if etype == "content_block_start":
+            block = event.get("content_block") or {}
+            kinds[index] = "thinking" if block.get("type") in ("thinking", "redacted_thinking") else "text"
+        elif etype == "content_block_delta":
+            if delta.get("type") == "text_delta":
+                add(kinds.get(index, "text"), index, delta.get("text"))
+            elif delta.get("type") == "thinking_delta":
+                add("thinking", index, delta.get("thinking") or delta.get("text"))
+        elif etype == "message_delta" and delta.get("stop_reason"):
+            out.finish_reason = delta["stop_reason"]
+        elif etype == "agent_done":
+            messages.extend(m for m in (event.get("messages") or []) if isinstance(m, dict))
+            if isinstance(event.get("steps"), int):
+                out.steps = event["steps"]
+            out.finish_reason = out.finish_reason or event.get("stop_reason")
+
+        naive = event.get("naivert")  # engine timings / usage side channels
+        if isinstance(naive, dict) and isinstance(naive.get("timings"), dict):
+            out.timings = naive["timings"]
+        for u in (event.get("usage"), (event.get("message") or {}).get("usage")):
+            if isinstance(u, dict):
+                out.usage.update({k: v for k, v in u.items() if v is not None})
+
+    out.text = "".join("".join(blocks[i]) for i in sorted(blocks) if kinds.get(i) == "text")
+    out.thinking = "".join("".join(blocks[i]) for i in sorted(blocks) if kinds.get(i) == "thinking")
+    if not (out.text or out.thinking) and messages:  # last resort: the final messages
+        out.thinking, out.text = _message_texts(messages)
+    return out
+
+
 async def post_completion(client: httpx.AsyncClient, url: str, headers: dict, payload: dict) -> tuple[Parsed, float]:
-    """One blocking request. Elapsed = send -> full body received (JSON parsing excluded)."""
+    """One blocking request. Elapsed = send -> full body received (parsing excluded)."""
     t0 = time.perf_counter()
     r = await client.post(url, json=payload, headers=headers)
     elapsed = time.perf_counter() - t0
     if r.status_code >= 400:
         raise ApiError(r.status_code, r.text[:500])
+    body = r.text
+    if body.lstrip().startswith(("data:", "event:")):  # streamed body
+        return parse_stream(body), elapsed
     return parse_response(r.json()), elapsed
 
 
@@ -937,7 +1002,10 @@ def parse_args() -> argparse.Namespace:
         "--endpoint", default=None, help=f"budget only: path appended to LLM_BASE_URL (default: {BUDGET_ENDPOINT})"
     )
     p.add_argument(
-        "--thinking-budget", type=int, default=None, help="budget only: budget_tokens sent when thinking is on"
+        "--thinking-budget",
+        type=int,
+        default=None,
+        help=f"budget only: budget_tokens sent when thinking is on (default: {DEFAULT_THINKING_BUDGET})",
     )
     p.add_argument("--max-completion-tokens", type=int, default=DEFAULT_MAX_COMPLETION_TOKENS)
     p.add_argument("--seed", type=int, default=None, help="sampling seed, sent only if set")

@@ -16,15 +16,15 @@ output: results/or_results.json
 verbose: false
 
 # defaults, overridable per model
-thinking_efforts: [low, high, max]
+thinking_efforts: [low, high]
 datasets: [math500, gpqa, hle]
 
 models:
   - model_id: deepseek/deepseek-v4.1-flash-1017
     inference_provider: wafer/us
     datasets: [math500, gpqa, hle]
-    thinking_efforts: [low, high, max]
-  - model_id: z-ai/glm-5.3-flash
-    inference_provider: wafer/us
-    datasets: [math500, gpqa]
-    thinking_efforts: [low, high, max]
+    thinking_efforts: [low, high]
+  # - model_id: z-ai/glm-5.3-flash
+  #   inference_provider: wafer/us
+  #   datasets: [math500, gpqa, hle]
+  #   thinking_efforts: [low, high]

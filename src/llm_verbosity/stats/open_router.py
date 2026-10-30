@@ -37,7 +37,7 @@ def send_request(
         "messages": [{"role": "user", "content": prompt}],
         "temperature": config.temperature,
         "top_p": config.top_p,
-        "max_completion_tokens": 256000,
+        "max_completion_tokens": 128000,
         "reasoning": {
             "enabled": config.thinking_effort != "none",
             "effort": config.thinking_effort,

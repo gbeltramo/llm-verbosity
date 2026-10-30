@@ -13,19 +13,27 @@ TEXT_ONLY   ?= 1
 MODEL_ID    ?=
 TOP_P       ?= 0.95
 TEMPERATURE ?= 1.0
-# none | low | medium (mid) | high | max
+# openrouter: none | low | mid | high | max ; budget: on | off
 THINKING    ?= none
-# openai | budget
-API_STYLE   ?= budget
-# endpoint path appended to LLM_BASE_URL; default: agent for budget, chat/completions for openai
+# openrouter | budget
+API_STYLE   ?= openrouter
+# openrouter only: provider slug(s), comma-separated; fallbacks are always disabled
+PROVIDER    ?= wafer/us
+# budget only: endpoint path appended to LLM_BASE_URL (default: agent)
 ENDPOINT    ?=
-WORKERS     ?= 2
+# budget only: budget_tokens sent when THINKING=on
+THINKING_BUDGET ?=
+RETRIES     ?= 5
+# per-request timeout in seconds (not streamed!)
+TIMEOUT     ?= 3600
+WORKERS     ?= 1
+OUTPUT_DIR  ?= llm_verbosity_stats
 # subset: LIMIT=10 -> first 10 per dataset; add OFFSET=20 to skip, or SUBSET_SEED=1 for a random pick
 LIMIT       ?= 2
 OFFSET      ?= 0
 SUBSET_SEED ?= 1
 # e.g. ONLY="MATH-500 hle-diamond" or ONLY="easy hard"
-ONLY        ?=
+ONLY        ?=easy
 # VERBOSE=1 enables --verbose
 VERBOSE     ?= 1
 EXTRA_ARGS  ?=
@@ -46,11 +54,16 @@ run-verbosity-analysis:
 		--temperature $(TEMPERATURE) \
 		--thinking $(THINKING) \
 		--api-style $(API_STYLE) \
+		$(if $(filter openrouter,$(API_STYLE)),--provider $(PROVIDER)) \
 		$(if $(ENDPOINT),--endpoint $(ENDPOINT)) \
+		$(if $(THINKING_BUDGET),--thinking-budget $(THINKING_BUDGET)) \
 		$(if $(LLM_SEED),--seed $(LLM_SEED)) \
 		--max-completion-tokens $(MAX_COMPLETION_TOKENS) \
+		--retries $(RETRIES) \
+		--timeout $(TIMEOUT) \
 		--workers $(WORKERS) \
 		--data-dir $(DATA_DIR) \
+		--output-dir $(OUTPUT_DIR) \
 		$(if $(LIMIT),--limit $(LIMIT)) \
 		$(if $(OFFSET),--offset $(OFFSET)) \
 		$(if $(SUBSET_SEED),--subset-seed $(SUBSET_SEED)) \

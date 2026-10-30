@@ -1,7 +1,7 @@
 # llm-verbosity
 
 Measure how verbose an LLM API is: **elapsed time, thinking tokens, answer (post-thinking)
-tokens, completion tokens and total tokens**, on easy / mid / hard Q&A.
+tokens, generated tokens (thinking + answer) and total tokens**, on easy / mid / hard Q&A.
 
 | Tag            | Difficulty | Source                                  |
 |----------------|------------|-----------------------------------------|
@@ -65,12 +65,17 @@ Output: a stats table + token provenance table + warnings summary on stdout, and
 
 ## Token counts and provenance
 
-| Metric              | Meaning                                              |
-|---------------------|------------------------------------------------------|
-| `thinking_tokens`   | reasoning tokens                                     |
-| `answer_tokens`     | tokens produced **after** thinking (visible answer)  |
-| `completion_tokens` | thinking + answer (everything the model generated)   |
-| `total_tokens`      | prompt + completion                                  |
+| Metric              | Meaning                                                       |
+|---------------------|---------------------------------------------------------------|
+| `thinking_tokens`   | reasoning tokens                                              |
+| `answer_tokens`     | tokens produced **after** thinking (visible answer)           |
+| `generated_tokens`  | thinking + answer: the total tokens created by the model      |
+| `completion_tokens` | the API's own completion number (may or may not include thinking) |
+| `total_tokens`      | prompt + completion                                           |
+
+The stats table reports `generated_tokens` as **Generated tok**: it is always computed as
+`thinking_tokens + answer_tokens`, so it means the same thing for both `--api-style openai` and
+`--api-style budget`, even when an API reports thinking outside its completion count.
 
 Every value is stored as `tokens.<metric>` with `token_sources.<metric>` in the JSON:
 
@@ -89,7 +94,7 @@ the visible text and `thinking_tokens = completion - answer` (also flagged as es
 because streamed thinking may be summarized and would undercount.
 
 In the table, `~` marks cells containing estimated/assumed values and `API-exact` is the number
-of questions whose four key metrics are all `api`/`derived`.
+of questions whose key metrics (`thinking`, `answer`, `generated`, `total`) are all `api`/`derived`.
 
 ## Warnings
 

@@ -1,9 +1,11 @@
 *~
 *.log
 *.db
+.env
 
 /dist/
 /build/
 /data/
 /llm_verbosity_stats/
 __pycache__/
+/results/

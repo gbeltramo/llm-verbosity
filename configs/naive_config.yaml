@@ -1,0 +1,27 @@
+base_url: ${oc.env:NAIVE_BASE_URL,null}     # e.g. https://plmgw-st.naiveai.com:20020
+api_key: ${oc.env:NAIVE_API_KEY,null}
+
+random_seed: 17          # sent as "seed" in the request body
+dataset_seed: 42         # used only to sample prompts
+len_subset: 2
+offset: 0
+data_dir: data
+
+# request params (from the curl example)
+max_tokens: 256000        # must be > thinking_budget, otherwise the answer can get cut off
+thinking_budget: 16384   # used whenever thinking is enabled
+web_tools: false
+code_tools: false
+canvas: true
+
+output: results/naive_results.json
+verbose: false
+
+# defaults, overridable per model
+thinking_modes: [true, false]
+datasets: [math500, gpqa, hle]
+
+models:
+  - model_id: naive-n0.5
+    datasets: [hle]
+    thinking_modes: [true]

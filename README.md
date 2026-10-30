@@ -47,62 +47,51 @@ make run-verbosity-analysis MODEL_ID=my-model LIMIT=10 SUBSET_SEED=1      # repr
 make run-verbosity-analysis MODEL_ID=my-model ONLY="easy hard" LIMIT=5    # only some datasets
 ```
 
-- `--api-style openai`: sends `reasoning_effort` (`none|low|medium|high|max`; `mid` = `medium`).
-- `--api-style budget`: adds `"thinking": {"type": "enabled", "budget_tokens": N}` to the payload
-  (low/medium/high/max = 2048/8192/16384/24576, override with `--thinking-budget`); `none`
-  removes the field.
-- Requests are streamed (SSE), run on `n` async workers and retried with exponential backoff on
-  transport errors, 408/409/425/429 and 5xx. Reported time = the successful attempt only
+- `--api-style openrouter` (default): POSTs to `https://openrouter.ai/api/v1/chat/completions`,
+  pins the provider with `"provider": {"only": ["wafer/us"], "allow_fallbacks": false}` and asks
+  for per-request usage accounting with `"usage": {"include": true}`. Thinking is controlled with
+  `"reasoning": {"enabled": ..., "effort": ...}` (`none|low|mid|high|max`; `mid` = `medium`).
+- `--api-style budget`: POSTs to `{LLM_BASE_URL}/agent`; `THINKING=on` adds
+  `"thinking": {"type": "enabled", "budget_tokens": N}` (default 4096, override with
+  `THINKING_BUDGET` / `--thinking-budget`), `THINKING=none` omits it.
+- The response is read exactly as the endpoint sends it: a JSON body (OpenRouter) or an SSE stream
+  (the agent API streams even with `"stream": false`). The parser keeps the **final
+  `message_delta`** (`usage` + `naivert.timings`) and the final `agent_done` messages.
+- Requests run on `n` async workers and are retried with exponential backoff on transport errors,
+  408/409/425/429 and 5xx. Reported time = the successful attempt only
   (`wall_with_retries_s` is stored in the JSON too).
 - `--verbose` logs, per question, the first/last 30 chars of thinking and completion with the
   dataset tag and the question index (index inside the parquet file, also with subsets).
 
-Output: a stats table + token provenance table + warnings summary on stdout, and a JSON in
+Output: a stats table + warnings summary on stdout, and a JSON in
 
 ```
-./llm_verbosity_stats/{model_id}_{top_p}_{temp}_thinking_{none|low|medium|high|max}.json
+./llm_verbosity_stats/{model_id}_{provider|budget}_{top_p}_{temp}_thinking_{...}.json
 ```
 
-## Token counts and provenance
+## What is measured
 
-| Metric              | Meaning                                                       |
-|---------------------|---------------------------------------------------------------|
-| `thinking_tokens`   | reasoning tokens                                              |
-| `answer_tokens`     | tokens produced **after** thinking (visible answer)           |
-| `generated_tokens`  | thinking + answer: the total tokens created by the model      |
-| `completion_tokens` | the API's own completion number (may or may not include thinking) |
-| `total_tokens`      | prompt + completion                                           |
+| Metric              | Meaning                                                                       |
+|---------------------|-------------------------------------------------------------------------------|
+| `elapsed_s`         | client-measured end-to-end request time                                       |
+| `tokens_per_s`      | all generated tokens per second: the engine's `predicted_per_second` when reported (agent API), else `completion_tokens / elapsed_s` |
+| `e2e_tokens_per_s`  | `completion_tokens / elapsed_s`, always                                       |
+| `prompt_tokens`     | prompt + cached prompt tokens                                                 |
+| `thinking_tokens`   | reasoning tokens (`output_tokens_details.thinking_tokens` / `completion_tokens_details.reasoning_tokens`) |
+| `answer_tokens`     | `completion_tokens - thinking_tokens`                                         |
+| `completion_tokens` | all generated tokens: thinking + answer                                       |
+| `total_tokens`      | prompt + completion                                                           |
 
-The stats table reports `generated_tokens` as **Generated tok**: it is always computed as
-`thinking_tokens + answer_tokens`, so it means the same thing for both `--api-style openai` and
-`--api-style budget`, even when an API reports thinking outside its completion count.
-
-Every value is stored as `tokens.<metric>` with `token_sources.<metric>` in the JSON:
-
-| Source      | Meaning                                                                       |
-|-------------|-------------------------------------------------------------------------------|
-| `api`       | reported verbatim by the API                                                  |
-| `derived`   | exact arithmetic on API numbers (e.g. `answer = completion - thinking`)       |
-| `estimated` | `chars/4` heuristic: **not exact**                                            |
-| `assumed`   | based on a hypothesis (e.g. no thinking requested -> 0 thinking tokens)       |
-| `missing`   | not available                                                                 |
-
-The cleanest answer-only number is `answer_tokens` with source `api`/`derived`, which needs the
-API to report thinking tokens (`completion_tokens_details.reasoning_tokens`, `reasoning_tokens`
-or `thinking_tokens`). If it only reports completion tokens, `answer_tokens` is estimated from
-the visible text and `thinking_tokens = completion - answer` (also flagged as estimated),
-because streamed thinking may be summarized and would undercount.
-
-In the table, `~` marks cells containing estimated/assumed values and `API-exact` is the number
-of questions whose key metrics (`thinking`, `answer`, `generated`, `total`) are all `api`/`derived`.
+Everything comes from the API response (`usage` block, engine timings). Missing fields are shown
+as `n/a` and reported as `missing_tokens`; nothing is estimated from text length. Table cells are
+mean (median). `tokens_per_s_source` in the JSON says whether `tokens_per_s` is the engine's
+`predicted_per_second` (`server`) or computed from the request time (`client`).
 
 ## Warnings
 
-Logged live and summarized at the end (and per question in the JSON): estimated or assumed
-token counts, missing usage block, truncated generations (`finish_reason=length`), empty
-answers (budget spent on thinking), suspected hidden thinking, `answer_tokens` inconsistent with
-the visible text, retries, permanent failures, and thinking settings that appear to be
-ignored by the endpoint.
+Logged live and summarized at the end (and per question in the JSON): missing usage block,
+missing token counts, truncated generations (`finish_reason=length`), empty answers (budget spent
+on thinking), retries, and permanent failures.
 
 ## Dev
 

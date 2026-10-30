@@ -1,0 +1,30 @@
+api_key: ${oc.env:OPENROUTER_API_KEY,null}
+
+temperature: 1.0
+top_p: 0.95
+random_seed: 42
+len_subset: 2
+offset: 0
+data_dir: data
+
+# generation-stats collection
+stats_initial_wait: 10      # seconds to wait once after all generations finish
+stats_max_attempts: 16
+stats_retry_delay: 2.0
+
+output: results/or_results.json
+verbose: false
+
+# defaults, overridable per model
+thinking_efforts: [low, high, max]
+datasets: [math500, gpqa, hle]
+
+models:
+  - model_id: deepseek/deepseek-v4.1-flash-1017
+    inference_provider: wafer/us
+    datasets: [math500]
+    thinking_efforts: [low]
+  - model_id: z-ai/glm-5.3-flash
+    inference_provider: wafer/us
+    datasets: [math500]
+    thinking_efforts: [low]
